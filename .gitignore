@@ -6,3 +6,7 @@ __pycache__/
 videos/*.scenes.json
 videos/*.thumbnails/
 models/
+
+# ticket-02 产物
+*.poses.npz
+artifacts/
