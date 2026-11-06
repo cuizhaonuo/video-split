@@ -168,14 +168,22 @@ def run_extraction(
     out_path: str | Path,
     fps: float = DEFAULT_FPS,
     min_conf: float = DEFAULT_MIN_CONF,
+    start_s: float | None = None,
+    end_s: float | None = None,
 ) -> dict:
-    """对视频做 5fps 姿态提取并持久化轨迹。返回结果元信息。"""
+    """对视频做 5fps 姿态提取并持久化轨迹。返回结果元信息。
+
+    start_s/end_s（秒，可选）限定处理区间；时间戳取自容器 pts，
+    因此分段提取后可直接按 timestamps_ms 拼接。
+    """
     video = Path(video)
     cap = cv2.VideoCapture(str(video))
     if not cap.isOpened():
         raise RuntimeError(f"无法打开视频: {video}")
     fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     fh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if start_s is not None:
+        cap.set(cv2.CAP_PROP_POS_MSEC, float(start_s) * 1000.0)
 
     ts_list: list[float] = []
     kp_list: list[np.ndarray] = []
@@ -185,6 +193,8 @@ def run_extraction(
 
     prev_bbox: np.ndarray | None = None
     for ts, frame in iter_frames_at_fps(cap, fps):
+        if end_s is not None and ts / 1000.0 > float(end_s):
+            break
         dets = [d for d in detector.detect(frame) if d.score >= min_conf]
         idx = choose_main_person(
             [d.bbox for d in dets], [d.score for d in dets], (fw, fh), prev_bbox
@@ -240,11 +250,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--fps", type=float, default=DEFAULT_FPS)
     ap.add_argument("--model", default=str(DEFAULT_MODEL))
     ap.add_argument("--min-conf", type=float, default=DEFAULT_MIN_CONF)
+    ap.add_argument("--start", type=float, default=None, help="起始秒（含），配合 --end 分块提取")
+    ap.add_argument("--end", type=float, default=None, help="结束秒（含）；时间戳仍为全片绝对时间")
     args = ap.parse_args(argv)
 
     out = Path(args.out) if args.out else default_sidecar_path(args.video)
     detector = YoloPoseDetector(args.model)
-    info = run_extraction(args.video, detector, out, fps=args.fps, min_conf=args.min_conf)
+    info = run_extraction(
+        args.video, detector, out, fps=args.fps, min_conf=args.min_conf,
+        start_s=args.start, end_s=args.end,
+    )
     print(
         f"完成: {info['frames']} 帧（检出 {info['detected']}，"
         f"覆盖率 {info['detected'] / max(1, info['frames']):.1%}），"
