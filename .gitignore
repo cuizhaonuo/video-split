@@ -1,0 +1,8 @@
+.scratch/
+venv/
+.worktrees/
+__pycache__/
+*.pyc
+videos/*.scenes.json
+videos/*.thumbnails/
+models/
