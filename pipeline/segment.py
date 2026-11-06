@@ -298,8 +298,9 @@ def analyze(
     thumb_rel: list[str | None] = []
     if make_thumbnails:
         extract_thumbnails(video, scene_starts, thumbs_dir)
+        # 存相对视频目录的路径（跨机器/目录可移植；前端按 /thumbnails/<文件名> 提供即可）
         thumb_rel = [
-            str((thumbs_dir / f"scene-{i:02d}.jpg").as_posix())
+            (Path(thumbs_dir.name) / f"scene-{i:02d}.jpg").as_posix()
             for i in range(1, len(scene_starts) + 1)
         ]
 
