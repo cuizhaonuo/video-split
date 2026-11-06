@@ -27,7 +27,7 @@ import cv2
 import numpy as np
 
 DEFAULT_MIN_SEGMENT_S = 5.0
-DEFAULT_PENALTY = 15.0
+DEFAULT_PENALTY = 15.0  # 真实 HIIT 轨迹实测: 33.5min → 38 段(中位 40s), 见票 03 验收
 DEFAULT_SMOOTH_WINDOW = 5  # 1s @5fps
 
 # COCO 17 关键点角度三元组（肘/肩/髋/膝，左右）
