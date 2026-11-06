@@ -216,6 +216,16 @@ def test_analyze_default_out_is_sidecar(e2e_env):
     assert list(thumbs_dir.glob("scene-*.jpg"))
 
 
+def test_scene_thumbnail_ms_matches_start(e2e_env):
+    """缩略图与时间戳严格一致：thumbnail_ms 存在且与 start_ms 差 ≤ 200ms。"""
+    video, npz, tmp_path = e2e_env
+    data = analyze(npz, min_segment_s=1.0)
+    assert data["scenes"]
+    for scene in data["scenes"]:
+        assert "thumbnail_ms" in scene
+        assert abs(scene["thumbnail_ms"] - scene["start_ms"]) <= 200
+
+
 def test_cli_with_npz_input(e2e_env, capsys):
     video, npz, tmp_path = e2e_env
     rc = main([npz, "--min-segment-s", "1"])

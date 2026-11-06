@@ -30,7 +30,7 @@ def test_scenes_cached_returns_analyzed_true(analyzed_sample: Path, client):
 def test_scenes_uncached_returns_analyzed_false(client):
     resp = client.get(f"/api/videos/{quote('训练视频.mp4')}/scenes")
     assert resp.status_code == 200
-    assert resp.json() == {"analyzed": False, "scenes": []}
+    assert resp.json() == {"analyzed": False, "scenes": [], "analyzing": False}
 
 
 def test_scenes_does_not_trigger_analysis(video_dir: Path, client):
@@ -80,14 +80,6 @@ def test_analyze_default_min_segment_is_5(video_dir: Path, client):
     resp = client.post(f"/api/videos/{quote('sample.mp4')}/analyze", json={})
     assert resp.status_code == 200
     assert resp.json()["params"]["min_segment_s"] == 5.0
-
-
-def test_analyze_without_poses_returns_409(client):
-    resp = client.post(
-        f"/api/videos/{quote('训练视频.mp4')}/analyze", json={"min_segment_s": 5}
-    )
-    assert resp.status_code == 409
-    assert "姿态" in resp.json()["detail"]
 
 
 def test_analyze_missing_video_404(client):

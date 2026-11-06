@@ -26,6 +26,13 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from pipeline.paths import (
+    poses_npz_path,
+    scenes_json_path,
+    thumbnail_filename,
+    thumbnails_dir,
+)
+
 DEFAULT_MIN_SEGMENT_S = 5.0
 DEFAULT_PENALTY = 15.0  # 真实 HIIT 轨迹实测: 33.5min → 38 段(中位 40s), 见票 03 验收
 DEFAULT_SMOOTH_WINDOW = 5  # 1s @5fps
@@ -219,14 +226,19 @@ def extract_thumbnails(
     video: str | Path,
     scene_starts_ms: list[int],
     out_dir: str | Path,
-) -> list[Path]:
-    """对每段起始时间戳 seek 抽帧存 JPG（scene-NN.jpg，NN 从 01 起）。"""
+) -> list[tuple[Path, int]]:
+    """对每段起始时间戳 seek 抽帧存 JPG（scene-NN.jpg，NN 从 01 起）。
+
+    返回 (路径, 实际解码帧时间戳 ms)：seek 后读回 ``CAP_PROP_POS_MSEC``，
+    记录真正抽到的那一帧时间（scenes 里存为 ``thumbnail_ms``，
+    保证缩略图与时间戳严格一致；``start_ms`` 保持段边界语义不变）。
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     cap = cv2.VideoCapture(str(video))
     if not cap.isOpened():
         raise RuntimeError(f"无法打开视频: {video}")
-    paths: list[Path] = []
+    results: list[tuple[Path, int]] = []
     try:
         for i, ts_ms in enumerate(scene_starts_ms, start=1):
             cap.set(cv2.CAP_PROP_POS_MSEC, float(ts_ms))
@@ -236,23 +248,24 @@ def extract_thumbnails(
                 cap = cv2.VideoCapture(str(video))  # 重新打开重试一次
                 cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, float(ts_ms) - 100.0))
                 ok, frame = cap.read()
-            p = out_dir / f"scene-{i:02d}.jpg"
+            if ok and frame is not None:
+                actual_ms = float(cap.get(cv2.CAP_PROP_POS_MSEC))
+            else:
+                actual_ms = float(ts_ms)  # 未抽到帧时退回段边界时间戳
+            p = out_dir / thumbnail_filename(i)
             if ok and frame is not None:
                 # cv2.imwrite 在 Windows 上对非 ASCII 路径静默失败，改用 imencode
                 ok_enc, buf = cv2.imencode(".jpg", frame)
                 if ok_enc:
                     buf.tofile(str(p))
-            paths.append(p)
+            results.append((p, int(round(actual_ms))))
     finally:
         cap.release()
-    return paths
+    return results
 
 
-def _default_paths(npz_path: Path, video: Path) -> tuple[Path, Path]:
-    return (
-        Path(str(video) + ".scenes.json"),
-        Path(str(video) + ".thumbnails"),
-    )
+def _default_paths(video: Path) -> tuple[Path, Path]:
+    return (scenes_json_path(video), thumbnails_dir(video))
 
 
 def analyze(
@@ -292,17 +305,19 @@ def analyze(
         int(round(timestamps[e - 1] + 1000.0 / fps)) for e in edges[1:]
     ]
 
-    out_json, thumbs_dir = _default_paths(npz_path, video)
+    out_json, thumbs_dir = _default_paths(video)
     out_json = Path(out) if out else out_json
 
     thumb_rel: list[str | None] = []
+    thumb_ms: list[int] = list(scene_starts)
     if make_thumbnails:
-        extract_thumbnails(video, scene_starts, thumbs_dir)
+        thumb_results = extract_thumbnails(video, scene_starts, thumbs_dir)
         # 存相对视频目录的路径（跨机器/目录可移植；前端按 /thumbnails/<文件名> 提供即可）
         thumb_rel = [
-            (Path(thumbs_dir.name) / f"scene-{i:02d}.jpg").as_posix()
+            (Path(thumbs_dir.name) / thumbnail_filename(i)).as_posix()
             for i in range(1, len(scene_starts) + 1)
         ]
+        thumb_ms = [ms for _, ms in thumb_results]
 
     scenes = [
         {
@@ -311,9 +326,10 @@ def analyze(
             "start_ms": s,
             "end_ms": e,
             "thumbnail": t,
+            "thumbnail_ms": ms,
         }
-        for i, (s, e, t) in enumerate(
-            zip(scene_starts, scene_ends, thumb_rel), start=1
+        for i, (s, e, t, ms) in enumerate(
+            zip(scene_starts, scene_ends, thumb_rel, thumb_ms), start=1
         )
     ]
     data = {
@@ -355,7 +371,7 @@ def main(argv: list[str] | None = None) -> int:
     if inp.suffix.lower() == ".npz":
         npz_path, video_path = inp, None
     else:
-        npz_path = Path(str(inp) + ".poses.npz")
+        npz_path = poses_npz_path(inp)
         video_path = inp
         if not npz_path.is_file():
             print(f"找不到姿态轨迹 {npz_path}，请先运行 python -m pipeline.extract_pose")
@@ -369,7 +385,7 @@ def main(argv: list[str] | None = None) -> int:
         penalty=args.penalty,
         smooth_window=args.smooth_window,
     )
-    out_path = args.out or str(_default_paths(npz_path, Path(data["video"]))[0])
+    out_path = args.out or str(_default_paths(Path(data["video"]))[0])
     print(
         f"完成: {len(data['scenes'])} 段, 时长 {data['duration_ms'] / 1000:.1f}s → {out_path}"
     )

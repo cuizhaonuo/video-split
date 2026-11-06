@@ -27,8 +27,9 @@ VIDEO_DIR=D:/some/other/videos D:/vscode-project/video-split/venv/Scripts/python
 | `GET /` | 视频列表页 |
 | `GET /watch/<视频名>` | 播放页：播放器 + 场景缩略图条 + 「重新分析」控件 |
 | `GET /video/<视频名>` | 视频流端点，支持 `Range` 请求（206/416），`Accept-Ranges: bytes` |
-| `GET /api/videos/<视频名>/scenes` | 读取分段缓存 sidecar `<视频名>.scenes.json`；无缓存返回 `{"analyzed": false, "scenes": []}`，**绝不触发分析**（缓存语义） |
-| `POST /api/videos/<视频名>/analyze` | 触发分析，body 可选 `{"min_segment_s": 5}`；用 subprocess 跑 `python -m pipeline.segment <视频名>.poses.npz --min-segment-s N`，同步等待（全片约 7s）后返回新 scenes；`poses.npz` 缺失返回 409 |
+| `GET /api/videos/<视频名>/scenes` | 读取分段缓存 sidecar `<视频名>.scenes.json`；无缓存返回 `{"analyzed": false, "scenes": [], "analyzing": …}`，**绝不触发分析**（缓存语义） |
+| `POST /api/videos/<视频名>/analyze` | 触发分析，body 可选 `{"min_segment_s": 5}`。npz 已存在 → 同步跑 `python -m pipeline.segment`（全片约 7s）并返回新 scenes；npz 缺失 → 后台线程跑 `python -m pipeline.extract_pose` → `pipeline.segment` 全链路（姿态提取可达 25 分钟+），返回 202 由前端轮询状态；同一视频任务运行中重复触发返回 409 |
+| `GET /api/videos/<视频名>/analyze/status` | 后台分析任务状态 `{running, stage: "extract"\|"segment"\|null, error}` |
 | `GET /thumbnails/<相对路径>` | 静态提供缩略图 JPG（路径即 scenes.json 的 `thumbnail` 字段，如 `<视频名>.mp4.thumbnails/scene-01.jpg`），带路径校验防目录遍历 |
 
 ## 场景导航界面（票 04）
@@ -49,3 +50,12 @@ D:/vscode-project/video-split/venv/Scripts/python.exe -m pytest -q
 ```
 
 测试视频 fixture 由 OpenCV 在运行时生成（`tests/conftest.py`），不提交二进制文件。
+
+## 设计说明 / 偏差
+
+以下为与 spec 字面描述的记录性偏差（有意为之）：
+
+- **抽帧用 OpenCV 逐帧解码**而非 spec 字面的 ffmpeg 调用：功能等价，免去外部二进制依赖；`imageio-ffmpeg` 已安装，后续如需切换成本很低。
+- **`extract_pose --start/--end` 分块**：为编排基础设施所需的长任务切分能力（时间戳取自容器 pts，分块可直接按 timestamps_ms 拼接）。
+- **缩略图条自动滚动跟随**（播放时当前段滚动进入视野）：票 04「当前段高亮」的体验增强，非 spec 必选项。
+- **主角选择在显著性之外加入 IoU/体型连续性权重**：票 02「遮挡后按位置+体型重新匹配」的显式要求（ADR-0002），非单纯每帧独立显著性最大者。

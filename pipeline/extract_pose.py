@@ -22,6 +22,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from pipeline.paths import poses_npz_path
+
 DEFAULT_FPS = 5.0
 DEFAULT_MODEL = Path("D:/vscode-project/video-split/models/yolo11n-pose.pt")
 DEFAULT_MIN_CONF = 0.25
@@ -240,7 +242,8 @@ def run_extraction(
 
 
 def default_sidecar_path(video: str | Path) -> Path:
-    return Path(str(video) + ".poses.npz")
+    """sidecar npz 路径（形状统一收口在 pipeline/paths.py）。"""
+    return poses_npz_path(video)
 
 
 def main(argv: list[str] | None = None) -> int:

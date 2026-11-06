@@ -6,16 +6,25 @@ import os
 import re
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    StreamingResponse,
+)
 from pydantic import BaseModel, Field
+
+from pipeline.paths import poses_npz_path, scenes_json_path
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 
 _ANALYZE_TIMEOUT_S = 600  # 全片 segment 约 7s，留足余量
+_EXTRACT_TIMEOUT_S = 3600  # 全片姿态提取可达 25 分钟+，留足余量
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_VIDEO_DIR = Path(os.environ.get("VIDEO_DIR", str(_REPO_ROOT / "videos")))
@@ -133,29 +142,54 @@ _SCENE_NAV_JS = """
     fetch(API + '/scenes').then(function (r) { return r.json(); }).then(render);
   }
 
+  var btn = document.getElementById('analyze-btn');
+  var pollTimer = null;
+
+  function setBtn(text, disabled) {
+    btn.textContent = text;
+    btn.disabled = disabled;
+  }
+
+  function analyzeDone(err) {
+    if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+    if (err) {
+      alert('\\u5206\\u6790\\u5931\\u8d25: ' + err);
+    }
+    setBtn('\\u91cd\\u65b0\\u5206\\u6790', false);
+    loadScenes();
+  }
+
+  function pollStatus() {
+    fetch(API + '/analyze/status').then(function (r) { return r.json(); }).then(function (st) {
+      if (!st.running) { analyzeDone(st.error); return; }
+      setBtn(st.stage === 'extract'
+        ? '\\u59ff\\u6001\\u63d0\\u53d6\\u4e2d\\u2026\\uff08\\u53ef\\u80fd\\u6570\\u5341\\u5206\\u949f\\uff09'
+        : '\\u5206\\u6bb5\\u5206\\u6790\\u4e2d\\u2026', true);
+      pollTimer = setTimeout(pollStatus, 1000);
+    }).catch(function () { pollTimer = setTimeout(pollStatus, 1000); });
+  }
+
   function doAnalyze() {
-    var btn = document.getElementById('analyze-btn');
     var minInput = document.getElementById('min-segment');
-    var orig = btn.textContent;
-    btn.disabled = true;
-    btn.textContent = '\\u5206\\u6790\\u4e2d\\u2026';
     var minSeg = parseFloat(minInput.value);
     if (!isFinite(minSeg) || minSeg <= 0) { minSeg = 5; }
+    setBtn('\\u5206\\u6790\\u4e2d\\u2026', true);
     fetch(API + '/analyze', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ min_segment_s: minSeg })
     }).then(function (r) {
+      if (r.status === 202) { pollStatus(); return null; }  // 后台任务：npz 缺失，先姿态提取再分段
       if (!r.ok) {
         return r.json().catch(function () { return null; }).then(function (err) {
-          alert('\\u5206\\u6790\\u5931\\u8d25: ' + ((err && err.detail) || r.status));
+          analyzeDone((err && err.detail) || r.status);
         });
       }
-      return r.json().then(render);
-    }).finally(function () {
-      btn.disabled = false;
-      btn.textContent = orig;
-    });
+      return r.json().then(function (data) {
+        render(data);
+        setBtn('\\u91cd\\u65b0\\u5206\\u6790', false);
+      });
+    }).catch(function () { analyzeDone('\\u7f51\\u7edc\\u9519\\u8bef'); });
   }
 
   videoEl.addEventListener('timeupdate', function () {
@@ -174,6 +208,13 @@ _SCENE_NAV_JS = """
 
   document.getElementById('analyze-btn').addEventListener('click', doAnalyze);
   document.getElementById('start-analyze-btn').addEventListener('click', doAnalyze);
+  // 页面刷新时若后台任务仍在运行，恢复轮询
+  fetch(API + '/analyze/status').then(function (r) { return r.json(); }).then(function (st) {
+    if (st.running) {
+      setBtn('\\u5206\\u6790\\u4e2d\\u2026', true);
+      pollStatus();
+    }
+  });
   loadScenes();
 })();
 """
@@ -185,10 +226,19 @@ def _list_videos(video_dir: Path) -> list[Path]:
     return sorted(p for p in video_dir.iterdir() if p.suffix.lower() in VIDEO_EXTENSIONS and p.is_file())
 
 
+def _resolve_under_dir(root: Path, name: str) -> Path | None:
+    """把 URL 中的相对名解析为 root 内的绝对路径；越出 root（路径遍历）返回 None。"""
+    root = root.resolve()
+    path = (root / name).resolve()
+    if not str(path).startswith(str(root) + os.sep):
+        return None
+    return path
+
+
 def _resolve_video(video_dir: Path, name: str) -> Path:
     """把 URL 中的视频名解析为目录内的文件，拒绝路径遍历。"""
-    path = (video_dir / name).resolve()
-    if not str(path).startswith(str(video_dir.resolve()) + os.sep) or not path.is_file():
+    path = _resolve_under_dir(video_dir, name)
+    if path is None or not path.is_file():
         raise HTTPException(status_code=404, detail="video not found")
     return path
 
@@ -200,6 +250,60 @@ class AnalyzeRequest(BaseModel):
 def create_app(video_dir: Path | None = None) -> FastAPI:
     video_dir = video_dir or _DEFAULT_VIDEO_DIR
     app = FastAPI()
+
+    # per-video 分析任务状态（同一视频同时只允许一个任务）
+    _task_lock = threading.Lock()
+    _tasks: dict[str, dict] = {}  # 视频名 → {running, stage, error}
+
+    def _task_state(name: str) -> dict:
+        with _task_lock:
+            return _tasks.setdefault(
+                name, {"running": False, "stage": None, "error": None}
+            )
+
+    def _run_analysis_chain(name: str, video: Path, npz: Path, min_segment_s: float) -> None:
+        """后台线程：姿态提取（npz 缺失时）→ 分段分析。结果写回任务状态。"""
+        state = _task_state(name)
+        env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+        try:
+            if not npz.is_file():
+                state["stage"] = "extract"
+                proc = subprocess.run(
+                    [sys.executable, "-m", "pipeline.extract_pose", str(video)],
+                    cwd=str(_REPO_ROOT),
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    env=env,
+                    timeout=_EXTRACT_TIMEOUT_S,
+                )
+                if proc.returncode != 0:
+                    state["error"] = f"姿态提取失败: {proc.stderr[-2000:]}"
+                    return
+            state["stage"] = "segment"
+            proc = subprocess.run(
+                [
+                    sys.executable, "-m", "pipeline.segment",
+                    str(npz), "--min-segment-s", str(min_segment_s),
+                ],
+                cwd=str(_REPO_ROOT),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+                timeout=_ANALYZE_TIMEOUT_S,
+            )
+            if proc.returncode != 0:
+                state["error"] = f"分段分析失败: {proc.stderr[-2000:]}"
+        except subprocess.TimeoutExpired:
+            state["error"] = "分析超时"
+        except Exception as exc:  # 后台线程兜底，异常必须落到状态里
+            state["error"] = f"分析异常: {exc}"
+        finally:
+            state["running"] = False
+            state["stage"] = None
 
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:
@@ -246,53 +350,78 @@ def create_app(video_dir: Path | None = None) -> FastAPI:
     def get_scenes(name: str):
         """读取 sidecar 缓存；不触发分析（缓存语义）。"""
         video = _resolve_video(video_dir, name)
-        sidecar = Path(str(video) + ".scenes.json")
+        sidecar = scenes_json_path(video)
+        state = _task_state(name)
         if not sidecar.is_file():
-            return {"analyzed": False, "scenes": []}
+            return {"analyzed": False, "scenes": [], "analyzing": state["running"]}
         data = json.loads(sidecar.read_text(encoding="utf-8"))
         data["analyzed"] = True
+        data["analyzing"] = state["running"]
         return data
+
+    @app.get("/api/videos/{name:path}/analyze/status")
+    def analyze_status(name: str):
+        """后台分析任务状态：{running, stage: "extract"|"segment"|null, error}。"""
+        _resolve_video(video_dir, name)
+        state = _task_state(name)
+        return {"running": state["running"], "stage": state["stage"], "error": state["error"]}
 
     @app.post("/api/videos/{name:path}/analyze")
     def analyze_video(name: str, body: AnalyzeRequest | None = None):
-        """subprocess 跑 pipeline.segment，同步等待（全片约 7s），完成后返回新 scenes。"""
+        """触发分析。npz 已存在 → 同步跑 segment（快）并返回新 scenes；
+        npz 缺失 → 后台线程跑 姿态提取→segment 全链路（提取可达 25 分钟+），返回 202 由前端轮询状态。"""
         if body is None:
             body = AnalyzeRequest()
         video = _resolve_video(video_dir, name)
-        npz = Path(str(video) + ".poses.npz")
-        if not npz.is_file():
-            raise HTTPException(
-                status_code=409,
-                detail=f"缺少姿态轨迹 {npz.name}，请先运行姿态提取（python -m pipeline.extract_pose）",
-            )
-        try:
-            proc = subprocess.run(
-                [
-                    sys.executable, "-m", "pipeline.segment",
-                    str(npz), "--min-segment-s", str(body.min_segment_s),
-                ],
-                cwd=str(_REPO_ROOT),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                env={**os.environ, "PYTHONIOENCODING": "utf-8"},
-                timeout=_ANALYZE_TIMEOUT_S,
-            )
-        except subprocess.TimeoutExpired:
-            raise HTTPException(status_code=500, detail=f"分析超时（>{_ANALYZE_TIMEOUT_S}s）")
-        if proc.returncode != 0:
-            raise HTTPException(status_code=500, detail=f"分析失败: {proc.stderr[-2000:]}")
-        data = json.loads(Path(str(video) + ".scenes.json").read_text(encoding="utf-8"))
-        data["analyzed"] = True
-        return data
+        npz = poses_npz_path(video)
+        state = _task_state(name)
+        with _task_lock:
+            if state["running"]:
+                raise HTTPException(status_code=409, detail="该视频已有分析任务在运行")
+            state["running"] = True
+            state["stage"] = None
+            state["error"] = None
+        if npz.is_file():
+            try:
+                proc = subprocess.run(
+                    [
+                        sys.executable, "-m", "pipeline.segment",
+                        str(npz), "--min-segment-s", str(body.min_segment_s),
+                    ],
+                    cwd=str(_REPO_ROOT),
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+                    timeout=_ANALYZE_TIMEOUT_S,
+                )
+            except subprocess.TimeoutExpired:
+                state["running"] = False
+                raise HTTPException(status_code=500, detail=f"分析超时（>{_ANALYZE_TIMEOUT_S}s）")
+            state["running"] = False
+            if proc.returncode != 0:
+                raise HTTPException(status_code=500, detail=f"分析失败: {proc.stderr[-2000:]}")
+            data = json.loads(scenes_json_path(video).read_text(encoding="utf-8"))
+            data["analyzed"] = True
+            return data
+        thread = threading.Thread(
+            target=_run_analysis_chain,
+            args=(name, video, npz, body.min_segment_s),
+            daemon=True,
+        )
+        thread.start()
+        return JSONResponse(
+            status_code=202,
+            content={"started": True, "running": True, "stage": "extract"},
+        )
 
     @app.get("/thumbnails/{path:path}")
     def thumbnail(path: str):
         """静态提供缩略图（scenes.json 里 thumbnail 字段的相对路径），防目录遍历。"""
-        full = (video_dir / path).resolve()
+        full = _resolve_under_dir(video_dir, path)
         if (
-            not str(full).startswith(str(video_dir.resolve()) + os.sep)
+            full is None
             or full.suffix.lower() != ".jpg"
             or not full.is_file()
         ):
