@@ -10,3 +10,6 @@ models/
 # ticket-02 产物
 *.poses.npz
 artifacts/
+
+# 大视频文件不入库
+videos/*.mp4
